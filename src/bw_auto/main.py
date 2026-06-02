@@ -176,10 +176,12 @@ def grab(
                 if len(tickets) == 1:
                     chosen_ticket = tickets[0]
                 else:
+                    from bw_auto.services.selection import _is_ticket_available
                     for i, tk in enumerate(tickets):
                         p = int(tk.get("price", 0)) / 100
                         n = tk.get("desc") or tk.get("name", "?")
-                        console.print(f"  [{i+1}] {n}  ￥{p:.0f}")
+                        s = "可购" if _is_ticket_available(tk) else "未开放"
+                        console.print(f"  [{i+1}] {n}  ￥{p:.0f}  [{s}]")
                     c = click.prompt("  选择票档", type=int, default=1)
                     chosen_ticket = tickets[c - 1]
                 sku_id = str(chosen_ticket["id"])

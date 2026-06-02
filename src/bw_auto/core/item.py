@@ -134,6 +134,7 @@ def sale_flag_label(item: Item) -> str:
 
 
 def print_item(item: Item) -> None:
+    from bw_auto.services.selection import _is_ticket_available
     flag = sale_flag_label(item)
     print(f"\n  商品: {item.name} (ID: {item.project_id})  状态: {flag}")
     print(f"  {'─' * 40}")
@@ -148,8 +149,9 @@ def print_item(item: Item) -> None:
         tickets = sc.get("ticket_list") or item.skus_for_screen(str(sc["id"]))
         for tk in tickets:
             if isinstance(tk, Sku):
-                print(f"         {tk.name}  ￥{tk.price_fen / 100:.0f}  库存:{tk.stock}")
+                print(f"         {tk.name}  ￥{tk.price_fen / 100:.0f}")
             else:
                 price_yuan = int(tk.get("price", 0)) / 100
                 name = tk.get("desc") or tk.get("name", "默认")
-                print(f"         {name}  ￥{price_yuan:.0f}  库存:{tk.get('sale_count', '?')}")
+                status = "可购" if _is_ticket_available(tk) else "未开放"
+                print(f"         {name}  ￥{price_yuan:.0f}  [{status}]")

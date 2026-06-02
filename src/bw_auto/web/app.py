@@ -22,7 +22,7 @@ from bw_auto.auth.qrcode import (
     qr_url_to_base64,
     check_login,
 )
-from bw_auto.auth.session import is_session_valid, load_cookies, save_cookies
+from bw_auto.auth.session import COOKIE_FILE, is_session_valid, load_cookies, save_cookies
 from bw_auto.api.show_api import get_buyer_list
 from bw_auto.config import get_settings
 from bw_auto.core.item import fetch_item, validate_item_for_grab
@@ -49,6 +49,7 @@ class GrabStartRequest(BaseModel):
     sku_id: str
     buy_num: int = 1
     pay_money_fen: int = 0
+    buyer_id: str = ""
     buyer_name: str
     buyer_tel: str
     buyer_id_card: str = ""
@@ -78,6 +79,16 @@ def _parse_dt(s: str | None) -> datetime | None:
 @app.get("/")
 async def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.post("/api/login/logout")
+async def login_logout():
+    import os
+    try:
+        os.remove(COOKIE_FILE)
+    except OSError:
+        pass
+    return {"ok": True}
 
 
 @app.get("/api/login/status")
@@ -176,20 +187,29 @@ async def grab_start(req: GrabStartRequest):
         if err:
             raise HTTPException(400, err)
 
-        # 获取完整购买人信息（nomask=1 返回完整数据）
+        # 获取完整购买人信息，优先用 buyer_id 精准匹配
         buyer_name = req.buyer_name
         buyer_tel = req.buyer_tel
         buyer_id_card = req.buyer_id_card
         buyer_id_card_type = req.buyer_id_card_type
+        buyer_db_id = req.buyer_id
         try:
             buyers = await get_buyer_list(client)
             for b in buyers:
-                if b.get("name") == req.buyer_name and (
+                if req.buyer_id and str(b.get("id", "")) == str(req.buyer_id):
+                    buyer_name = b.get("name", buyer_name)
+                    buyer_tel = b.get("tel", buyer_tel)
+                    buyer_id_card = b.get("personal_id", buyer_id_card)
+                    buyer_id_card_type = int(b.get("id_type", buyer_id_card_type) or 0)
+                    buyer_db_id = str(b.get("id", ""))
+                    break
+                elif not req.buyer_id and b.get("name") == req.buyer_name and (
                     b.get("tel") == req.buyer_tel or b.get("phone") == req.buyer_tel
                 ):
                     buyer_tel = b.get("tel", buyer_tel)
                     buyer_id_card = b.get("personal_id", buyer_id_card)
                     buyer_id_card_type = int(b.get("id_type", buyer_id_card_type) or 0)
+                    buyer_db_id = str(b.get("id", ""))
                     break
         except Exception:
             pass
@@ -217,6 +237,7 @@ async def grab_start(req: GrabStartRequest):
                 tel=buyer_tel,
                 id_card_no=buyer_id_card,
                 id_card_type=buyer_id_card_type,
+                buyer_id=buyer_db_id,
             ),
             sale_time=sale_time,
             schedule_start=_parse_dt(req.schedule_start),
@@ -286,10 +307,53 @@ async def grab_cancel(job_id: str):
     return {"ok": True}
 
 
+def _open_browser(url: str) -> None:
+    """用应用模式打开浏览器窗口（无地址栏，像独立 App）"""
+    import shutil
+    import subprocess
+    import sys
+
+    # 尝试 Chrome/Edge 应用模式
+    for browser in ("chrome", "edge", "chromium"):
+        exe = shutil.which(browser)
+        if not exe:
+            continue
+        try:
+            subprocess.Popen(
+                [exe, f"--app={url}", "--window-size=420,820"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        except Exception:
+            continue
+
+    # 兜底：系统默认浏览器
+    import webbrowser
+    webbrowser.open(url)
+
+
 def run_server() -> None:
+    import asyncio
     import uvicorn
 
     s = get_settings()
+    url = f"http://{s.web_host}:{s.web_port}"
+
+    # 延迟 1.5s 后自动打开浏览器
+    async def _delayed_open() -> None:
+        await asyncio.sleep(1.5)
+        _open_browser(url)
+
+    # 在后台线程中调度
+    import threading
+    def _schedule() -> None:
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(_delayed_open())
+
+    threading.Thread(target=_schedule, daemon=True).start()
+
+    print(f"\n  bw-auto Web 已启动 → {url}\n")
     uvicorn.run(
         "bw_auto.web.app:app",
         host=s.web_host,

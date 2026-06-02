@@ -39,20 +39,52 @@ def buyer_from_api_row(row: dict[str, Any]) -> BuyerInfo:
     )
 
 
+def _is_ticket_available(tk: dict[str, Any]) -> bool:
+    """检查票档当前是否可购买"""
+    now = datetime.now()
+    sale_start = tk.get("sale_start")
+    sale_end = tk.get("sale_end")
+    if not sale_start and not sale_end:
+        return True  # 无时间限制
+    if sale_start:
+        try:
+            if isinstance(sale_start, str):
+                sale_start = datetime.strptime(sale_start, "%Y-%m-%d %H:%M:%S")
+            elif isinstance(sale_start, (int, float)):
+                sale_start = datetime.fromtimestamp(float(sale_start))
+            if now < sale_start:
+                return False
+        except (ValueError, TypeError, OSError):
+            pass
+    if sale_end:
+        try:
+            if isinstance(sale_end, str):
+                sale_end = datetime.strptime(sale_end, "%Y-%m-%d %H:%M:%S")
+            elif isinstance(sale_end, (int, float)):
+                sale_end = datetime.fromtimestamp(float(sale_end))
+            if now > sale_end:
+                return False
+        except (ValueError, TypeError, OSError):
+            pass
+    return True
+
+
 def item_to_api_dict(item: Item) -> dict[str, Any]:
     screens_out = []
     for sc in item.raw.get("screen_list") or []:
         sid = str(sc.get("id", ""))
         tickets = []
         for tk in sc.get("ticket_list") or []:
+            available = _is_ticket_available(tk)
             tickets.append(
                 {
                     "id": str(tk.get("id", "")),
                     "name": tk.get("desc") or tk.get("name", ""),
                     "price_yuan": int(tk.get("price", 0) or 0) / 100,
                     "price_fen": int(tk.get("price", 0) or 0),
-                    "stock": tk.get("sale_count"),
-                    "limit": tk.get("limit_per_user"),
+                    "available": available,
+                    "sale_start": tk.get("sale_start"),
+                    "sale_end": tk.get("sale_end"),
                 }
             )
         if not tickets:
@@ -63,8 +95,9 @@ def item_to_api_dict(item: Item) -> dict[str, Any]:
                         "name": sk.name,
                         "price_yuan": sk.price_fen / 100,
                         "price_fen": sk.price_fen,
-                        "stock": sk.stock,
-                        "limit": sk.limit_per_user,
+                        "available": True,
+                        "sale_start": None,
+                        "sale_end": None,
                     }
                 )
         start = sc.get("sale_start")

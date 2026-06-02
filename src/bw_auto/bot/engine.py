@@ -126,10 +126,16 @@ class GrabEngine:
             self.state = State.WAITING
             timer = PreciseTimer(time_offset_ms=offset, pre_fire_ms=plan.pre_fire_ms)
             self._timer = timer
+            wait_secs = (plan.sale_time - datetime.now()).total_seconds()
             self._log(f"  [开售时间] {plan.sale_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            if wait_secs > 0:
+                self._log(f"  [待机] 距离开售还有 {wait_secs:.0f} 秒，进入待机状态...")
             await timer.wait_until(
                 plan.sale_time,
-                on_tick=lambda s: self._log(f"  [倒计时] {s:.0f}s") if s <= 30 else None,
+                on_tick=lambda s: (
+                    self._log(f"  [待机] 距开售 {s:.0f}s") if s > 30
+                    else self._log(f"  [倒计时] {s:.0f}s")
+                ),
             )
             if self._cancelled:
                 self.state = State.CANCELLED
