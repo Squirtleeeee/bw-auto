@@ -356,10 +356,11 @@ def run_server() -> None:
 
     threading.Thread(target=_schedule, daemon=True).start()
 
-    print(f"\n  bw-auto Web 已启动 → {url}\n")
+    print(f"\n  bw-auto Web 已启动 -> {url}\n")
     uvicorn.run(
         "bw_auto.web.app:app",
         host=s.web_host,
         port=s.web_port,
         reload=False,
+        log_config=None,
     )
