@@ -37,8 +37,11 @@ from bw_auto.services.selection import (
 )
 from bw_auto.web.state import GrabJob, app_state
 
-STATIC_DIR = Path(__file__).parent / "static"
-
+import sys as _sys
+if getattr(_sys, "frozen", False):
+    STATIC_DIR = Path(_sys._MEIPASS) / "src" / "bw_auto" / "web" / "static"
+else:
+    STATIC_DIR = Path(__file__).parent / "static"
 app = FastAPI(title="bw-auto", version="0.2.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
