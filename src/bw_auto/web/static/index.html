@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>bw-auto 会员购抢票</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a2332;
+      --accent: #00a1d6;
+      --text: #e8ecf1;
+      --muted: #8b9bb4;
+      --ok: #2ecc71;
+      --err: #e74c3c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px;
+      line-height: 1.5;
+    }
+    h1 { font-size: 1.5rem; margin: 0 0 8px; }
+    .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 24px; }
+    .grid { display: grid; gap: 16px; max-width: 720px; }
+    .card {
+      background: var(--card);
+      border-radius: 12px;
+      padding: 20px;
+      border: 1px solid #2a3548;
+    }
+    .card h2 { font-size: 1rem; margin: 0 0 12px; color: var(--accent); }
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin: 10px 0 4px; }
+    input, select {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid #2a3548;
+      background: #0f1419;
+      color: var(--text);
+    }
+    button {
+      margin-top: 12px;
+      padding: 10px 18px;
+      border: none;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary { background: #2a3548; }
+    #qr img { max-width: 200px; border-radius: 8px; background: #fff; padding: 8px; }
+    #log {
+      font-family: ui-monospace, monospace;
+      font-size: 0.8rem;
+      max-height: 220px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      color: var(--muted);
+    }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+    .badge.ok { background: #1e3d2f; color: var(--ok); }
+    .badge.err { background: #3d1e1e; color: var(--err); }
+    .hidden { display: none; }
+    .success-box {
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 8px;
+      background: #1e3d2f;
+      border: 1px solid var(--ok);
+    }
+  </style>
+</head>
+<body>
+  <h1>bw-auto</h1>
+  <p class="sub">扫码登录 → 填写商品编号 → 选场次票档与购买人 → 定时抢票 → App 内支付</p>
+
+  <div class="grid">
+    <section class="card" id="sec-login">
+      <h2>1. 登录 Bilibili</h2>
+      <p id="login-status">检查登录状态...</p>
+      <div id="qr" class="hidden">
+        <img id="qr-img" alt="登录二维码" />
+        <p id="qr-msg"></p>
+      </div>
+      <button type="button" id="btn-login">获取二维码</button>
+    </section>
+
+    <section class="card hidden" id="sec-project">
+      <h2>2. 商品与选项</h2>
+      <label>商品 project_id</label>
+      <input id="project-id" placeholder="如 1000322" />
+      <button type="button" id="btn-load">加载商品</button>
+      <p id="load-status" class="sub"></p>
+      <label>场次</label>
+      <select id="screen"></select>
+      <label>票档</label>
+      <select id="sku"></select>
+      <label>数量</label>
+      <input id="buy-num" type="number" value="1" min="1" />
+      <label>购买人（须已在 B 站会员购中添加实名信息）</label>
+      <select id="buyer"></select>
+      <p id="buyer-hint" class="sub"></p>
+    </section>
+
+    <section class="card hidden" id="sec-schedule">
+      <h2>3. 时间与抢票参数</h2>
+      <div class="row">
+        <div>
+          <label>脚本启动时间（可选，留空=立即）</label>
+          <input id="schedule-start" type="datetime-local" />
+        </div>
+        <div>
+          <label>开售时间（自动填充，可改）</label>
+          <input id="sale-time" type="datetime-local" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>提前发单 (ms)</label>
+          <input id="pre-fire" type="number" value="200" />
+        </div>
+        <div>
+          <label>失败重试间隔 (ms)</label>
+          <input id="grab-interval" type="number" value="300" />
+        </div>
+      </div>
+      <label>最大尝试次数</label>
+      <input id="max-attempts" type="number" value="15" min="1" />
+      <button type="button" id="btn-grab">开始抢票</button>
+      <button type="button" class="secondary" id="btn-cancel" disabled>取消任务</button>
+      <p id="grab-status" class="sub"></p>
+    </section>
+
+    <section class="card hidden" id="sec-log">
+      <h2>4. 运行日志</h2>
+      <div id="log"></div>
+      <div id="result" class="hidden"></div>
+    </section>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let pollTimer = null;
+    let jobPollTimer = null;
+    let currentJobId = null;
+    let projectData = null;
+    let buyers = [];
+
+    function formatApiError(data, statusText) {
+      const d = data.detail;
+      if (Array.isArray(d)) return d.map((x) => x.msg || String(x)).join("；");
+      if (typeof d === "object" && d) return d.msg || JSON.stringify(d);
+      return d || data.message || statusText || "请求失败";
+    }
+
+    async function api(path, opts = {}) {
+      const r = await fetch(path, {
+        headers: { "Content-Type": "application/json" },
+        ...opts,
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(formatApiError(data, r.statusText));
+      return data;
+    }
+
+    function toLocalInput(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      const p = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+    }
+
+    async function refreshLogin() {
+      try {
+        const s = await api("/api/login/status");
+        if (s.logged_in) {
+          $("login-status").innerHTML = `<span class="badge ok">已登录</span> UID: ${s.uid}`;
+          $("sec-project").classList.remove("hidden");
+          $("sec-schedule").classList.remove("hidden");
+          $("qr").classList.add("hidden");
+          if (pollTimer) clearInterval(pollTimer);
+        } else {
+          $("login-status").textContent = "未登录，请扫码";
+        }
+      } catch (e) {
+        $("login-status").textContent = e.message;
+      }
+    }
+
+    $("btn-login").onclick = async () => {
+      try {
+        const q = await api("/api/login/qrcode/start", { method: "POST" });
+        $("qr").classList.remove("hidden");
+        $("qr-img").src = "data:image/png;base64," + q.image_base64;
+        $("qr-msg").textContent = "请用 Bilibili App 扫码";
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(async () => {
+          try {
+            const p = await api("/api/login/qrcode/poll");
+            $("qr-msg").textContent = p.message;
+            if (p.status === "success" && p.logged_in) await refreshLogin();
+            if (p.status === "expired") $("qr-msg").textContent = "已过期，请重新获取";
+          } catch (_) {}
+        }, 1500);
+      } catch (e) {
+        alert(e.message);
+      }
+    };
+
+    function fillTickets(screenId) {
+      const sc = projectData.screens.find((s) => s.id === screenId);
+      const skuSel = $("sku");
+      skuSel.innerHTML = "";
+      (sc?.tickets || []).forEach((t) => {
+        const o = document.createElement("option");
+        o.value = t.id;
+        o.textContent = `${t.name} ￥${t.price_yuan} 库存:${t.stock ?? "?"}`;
+        o.dataset.fen = t.price_fen;
+        skuSel.appendChild(o);
+      });
+      if (sc?.sale_start) $("sale-time").value = toLocalInput(sc.sale_start);
+    }
+
+    $("btn-load").onclick = async () => {
+      const id = $("project-id").value.trim();
+      if (!id) {
+        $("load-status").textContent = "请输入商品编号";
+        return;
+      }
+      const btn = $("btn-load");
+      btn.disabled = true;
+      $("load-status").textContent = "加载中，请稍候...";
+      try {
+        const s = await api("/api/login/status");
+        if (!s.logged_in) {
+          $("load-status").textContent = "请先扫码登录后再加载商品";
+          return;
+        }
+        const data = await api(`/api/project/${id}`);
+        projectData = data.project;
+        buyers = data.buyers;
+        $("load-status").innerHTML =
+          `<span class="badge ok">已加载</span> ${projectData.name}` +
+          (projectData.sale_flag_label ? `（${projectData.sale_flag_label}）` : "");
+        $("screen").innerHTML = "";
+        projectData.screens.forEach((s) => {
+          const o = document.createElement("option");
+          o.value = s.id;
+          o.textContent = s.name + (s.sale_start ? ` (${s.sale_start.replace("T"," ")})` : "");
+          $("screen").appendChild(o);
+        });
+        $("buyer").innerHTML = "";
+        if (!buyers.length) {
+          $("buyer-hint").textContent =
+            "未找到购买人：请先在 Bilibili App「会员购」中添加实名购买人后再刷新";
+        } else {
+          $("buyer-hint").textContent = "";
+          buyers.forEach((b, i) => {
+            const o = document.createElement("option");
+            o.value = i;
+            o.textContent = `${b.name} ${b.tel} ${b.id_card_masked}`;
+            $("buyer").appendChild(o);
+          });
+        }
+        if (!projectData.screens.length) {
+          $("load-status").textContent = "加载成功，但未找到场次信息";
+        }
+        fillTickets($("screen").value);
+        $("sec-log").classList.remove("hidden");
+      } catch (e) {
+        $("load-status").innerHTML = `<span class="badge err">加载失败</span> ${e.message}`;
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    $("screen").onchange = () => fillTickets($("screen").value);
+
+    function dtLocalToApi(v) {
+      if (!v) return null;
+      return v.replace("T", " ") + ":00";
+    }
+
+    $("btn-grab").onclick = async () => {
+      if (!projectData) {
+        $("grab-status").textContent = "请先加载商品";
+        return;
+      }
+      if (!buyers.length) {
+        $("grab-status").textContent = "请先在 B 站 App 会员购添加购买人，然后重新加载商品";
+        return;
+      }
+      if (!$("sku").value || !$("screen").value) {
+        $("grab-status").textContent = "请选择场次和票档";
+        return;
+      }
+      if (!$("sale-time").value) {
+        $("grab-status").textContent = "请填写开售时间";
+        return;
+      }
+      const b = buyers[$("buyer").value];
+      if (!b) {
+        $("grab-status").textContent = "请选择购买人";
+        return;
+      }
+      const btn = $("btn-grab");
+      btn.disabled = true;
+      $("grab-status").textContent = "正在提交抢票任务...";
+      $("sec-log").classList.remove("hidden");
+      const skuOpt = $("sku").selectedOptions[0];
+      const body = {
+        project_id: $("project-id").value.trim(),
+        screen_id: $("screen").value,
+        sku_id: $("sku").value,
+        buy_num: parseInt($("buy-num").value, 10) || 1,
+        pay_money_fen: parseInt(skuOpt?.dataset.fen || 0, 10) * (parseInt($("buy-num").value, 10) || 1),
+        buyer_name: b.name,
+        buyer_tel: b.tel,
+        sale_time: dtLocalToApi($("sale-time").value),
+        schedule_start: dtLocalToApi($("schedule-start").value),
+        pre_fire_ms: parseFloat($("pre-fire").value),
+        grab_interval_ms: parseFloat($("grab-interval").value),
+        max_attempts: parseInt($("max-attempts").value, 10),
+      };
+      try {
+        const res = await api("/api/grab/start", { method: "POST", body: JSON.stringify(body) });
+        currentJobId = res.job_id;
+        $("btn-cancel").disabled = false;
+        $("grab-status").innerHTML = `<span class="badge ok">任务已启动</span> ${currentJobId}`;
+        $("log").textContent = "任务已启动: " + currentJobId + "\n开售: " + (res.sale_time || "") + "\n";
+        $("result").classList.add("hidden");
+        if (jobPollTimer) clearInterval(jobPollTimer);
+        jobPollTimer = setInterval(pollJob, 800);
+        pollJob();
+      } catch (e) {
+        $("grab-status").innerHTML = `<span class="badge err">启动失败</span> ${e.message}`;
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    async function pollJob() {
+      if (!currentJobId) return;
+      try {
+        const j = await api(`/api/grab/${currentJobId}`);
+        $("log").textContent = j.logs.join("\n");
+        if (j.state !== "running" && j.state !== "pending") {
+          clearInterval(jobPollTimer);
+          $("btn-cancel").disabled = true;
+          const box = $("result");
+          box.classList.remove("hidden");
+          if (j.result?.success) {
+            box.innerHTML = `<div class="success-box"><strong>下单成功</strong><br>订单号: ${j.result.order_id}<br>请尽快在 Bilibili App 中完成支付</div>`;
+          } else {
+            box.innerHTML = `<span class="badge err">失败</span> ${j.result?.message || j.state}`;
+          }
+        }
+      } catch (e) {
+        $("grab-status").innerHTML = `<span class="badge err">状态查询失败</span> ${e.message}`;
+      }
+    }
+
+    $("btn-cancel").onclick = async () => {
+      if (!currentJobId) return;
+      await api(`/api/grab/${currentJobId}/cancel`, { method: "POST" });
+    };
+
+    refreshLogin();
+  </script>
+</body>
+</html>

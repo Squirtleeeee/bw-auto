@@ -57,7 +57,7 @@ class LoginResult:
 # API 调用
 # ---------------------------------------------------------------------------
 
-async def _generate_qrcode(client: httpx.AsyncClient) -> QRCodeInfo:
+async def generate_qrcode(client: httpx.AsyncClient) -> QRCodeInfo:
     resp = await client.get(GENERATE_URL)
     resp.raise_for_status()
     data = resp.json()
@@ -67,6 +67,19 @@ async def _generate_qrcode(client: httpx.AsyncClient) -> QRCodeInfo:
         url=data["data"]["url"],
         qrcode_key=data["data"]["qrcode_key"],
     )
+
+
+async def poll_qrcode_once(
+    client: httpx.AsyncClient, qrcode_key: str
+) -> tuple[int, str, dict[str, Any] | None]:
+    """返回 (code, message, cookie_data_on_success)"""
+    result, resp = await _poll_status(client, qrcode_key)
+    code = result["code"]
+    msg = result.get("message", "")
+    if code == CODE_SUCCESS:
+        _write_cookies_from_response(client, resp)
+        return code, msg, result.get("data")
+    return code, msg, None
 
 
 async def _poll_status(client: httpx.AsyncClient, qrcode_key: str) -> tuple[dict[str, Any], httpx.Response]:
@@ -105,9 +118,22 @@ def _write_cookies_from_response(client: httpx.AsyncClient, resp: httpx.Response
 # 主流程
 # ---------------------------------------------------------------------------
 
+def qr_url_to_base64(url: str) -> str:
+    import base64
+    import io
+
+    import qrcode
+
+    img = qrcode.make(url)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
 def render_qr_terminal(url: str) -> None:
     """在终端输出二维码 ASCII 图"""
     import qrcode
+
     qr = qrcode.QRCode(border=1)
     qr.add_data(url)
     qr.make(fit=True)
@@ -119,7 +145,7 @@ async def qrcode_login(client: httpx.AsyncClient) -> LoginResult:
     attempt = 0
     while True:
         attempt += 1
-        qr = await _generate_qrcode(client)
+        qr = await generate_qrcode(client)
         print(f"\n{'='*50}")
         print(f"  [第 {attempt} 次] 请用 Bilibili App 扫码：")
         print(f"{'='*50}\n")

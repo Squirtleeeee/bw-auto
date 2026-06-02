@@ -1,25 +1,34 @@
-"""
-抢票引擎 — 状态机编排整个流程。
-"""
+"""抢票引擎 — 定时、预热、到点下单、间隔重试"""
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from enum import Enum, auto
+from typing import Awaitable, Callable
 
 import httpx
 
-from bw_auto.core.item import fetch_item, print_item
-from bw_auto.core.models import BuyerInfo, Item, OrderPayload
-from bw_auto.core.order import build_payload, payload_to_dict, submit_order
+from bw_auto.core.item import fetch_item, validate_item_for_grab
+from bw_auto.core.models import GrabPlan, OrderPayload, OrderResult
+from bw_auto.core.order import (
+    build_payload,
+    fetch_order_token,
+    is_retryable,
+    payload_to_dict,
+    submit_order,
+)
 from bw_auto.core.scheduler import PreciseTimer
+from bw_auto.http_client import prewarm_client
 from bw_auto.utils.time_sync import sync_time
+
+LogFn = Callable[[str], None]
 
 
 class State(Enum):
     IDLE = auto()
-    LOGGED_IN = auto()
-    ITEM_LOADED = auto()
+    SCHEDULED = auto()
+    PREPARING = auto()
     WAITING = auto()
     ORDERING = auto()
     SUCCESS = auto()
@@ -28,95 +37,129 @@ class State(Enum):
 
 
 class GrabEngine:
-    """抢票引擎"""
-
-    def __init__(self, client: httpx.AsyncClient):
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        log: LogFn | None = None,
+    ):
         self.client = client
         self.state = State.IDLE
-        self.item: Item | None = None
         self._cancelled = False
+        self._log = log or (lambda msg: print(msg, flush=True))
+        self._timer: PreciseTimer | None = None
+        self.last_result: OrderResult | None = None
 
-    async def load_item(self, project_id: str) -> Item:
-        self.item = await fetch_item(self.client, project_id)
-        self.state = State.ITEM_LOADED
-        print_item(self.item)
-        return self.item
+    def cancel(self) -> None:
+        self._cancelled = True
+        if self._timer:
+            self._timer.cancel()
+        self.state = State.CANCELLED
 
-    async def grab(
-        self,
-        item: Item,
-        screen_id: str = "",
-        sku_id: str = "",
-        buy_num: int = 1,
-        buyer: BuyerInfo | None = None,
-        sale_time: datetime | None = None,
-        pre_fire_ms: float = 150.0,
-    ):
-        """执行抢票"""
-        screen_id = screen_id or item.first_screen_id
-        sku_id = sku_id or item.first_sku_id
-
-        if sale_time is None:
-            screen = next((s for s in item.screens if s.screen_id == screen_id), None)
-            if screen and screen.sale_start:
-                sale_time = screen.sale_start
-            else:
-                raise ValueError("无法确定开售时间，请手动指定 sale_time 参数")
-
-        # 从 models 中查找 SKU 价格 (元) → 转为分
-        sku = next((s for s in item.skus if s.sku_id == sku_id), None)
-        pay_money = (sku.price * 100) if sku else 0.0
-
-        payload = build_payload(
-            project_id=item.project_id,
-            screen_id=screen_id,
-            sku_id=sku_id,
-            buy_num=buy_num,
-            pay_money=pay_money,
-            buyer=buyer,
-        )
-        body = payload_to_dict(payload)
-
-        # 时间同步
-        offset = await sync_time(self.client)
-        print(f"  [时间同步] 服务器偏移: {offset:+.1f}ms")
-
-        timer = PreciseTimer(time_offset_ms=offset, pre_fire_ms=pre_fire_ms)
-
+    async def _wait_until(self, target: datetime, label: str) -> bool:
+        if self._cancelled:
+            return False
         now = datetime.now()
-        wait_secs = (sale_time - now).total_seconds()
-        print(f"  [开售时间] {sale_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"  [等待时长] {wait_secs:.1f} 秒")
+        secs = (target - now).total_seconds()
+        if secs <= 0:
+            return True
+        self._log(f"  [{label}] 等待至 {target.strftime('%Y-%m-%d %H:%M:%S')}（约 {secs:.0f}s）")
+        timer = PreciseTimer()
+        self._timer = timer
 
-        if wait_secs < 0:
-            print(f"  [警告] 开售时间已过，直接尝试下单...")
-        elif wait_secs > 5:
-            print(f"  进入等待...")
+        def tick(remaining: float) -> None:
+            if remaining > 60:
+                return
+            self._log(f"  [{label}] 剩余 {remaining:.0f}s")
 
-        self.state = State.WAITING
+        await timer.wait_until(target, on_tick=tick)
+        return not self._cancelled
 
+    async def run(self, plan: GrabPlan) -> OrderResult | None:
         if self._cancelled:
             self.state = State.CANCELLED
             return None
 
-        if wait_secs >= 0:
-            await timer.wait_until(sale_time)
-        self.state = State.ORDERING
-
-        print(f"\n  [下单] 发送请求...")
-        t0 = datetime.now()
-        result = await submit_order(self.client, body)
-        elapsed = (datetime.now() - t0).total_seconds() * 1000
-
-        if result.success:
-            self.state = State.SUCCESS
-            print(f"  [成功] order_id={result.order_id} (耗时 {elapsed:.0f}ms)")
-        else:
+        item = await fetch_item(self.client, plan.project_id)
+        err = validate_item_for_grab(item, plan.screen_id, plan.sku_id, plan.buy_num)
+        if err:
             self.state = State.FAILED
-            print(f"  [失败] {result.message} (耗时 {elapsed:.0f}ms)")
+            self.last_result = OrderResult(success=False, message=err)
+            return self.last_result
 
-        return result
+        sku = item.get_sku(plan.sku_id)
+        pay_fen = plan.pay_money_fen or (sku.price_fen * plan.buy_num if sku else 0)
 
-    def cancel(self):
-        self._cancelled = True
-        self.state = State.CANCELLED
+        if plan.schedule_start:
+            self.state = State.SCHEDULED
+            ok = await self._wait_until(plan.schedule_start, "脚本启动")
+            if not ok:
+                return None
+
+        self.state = State.PREPARING
+        offset = await sync_time(self.client)
+        self._log(f"  [时间同步] 服务器偏移 {offset:+.1f}ms")
+        await prewarm_client(self.client, plan.project_id, plan.prewarm_connections)
+
+        token = await fetch_order_token(
+            self.client,
+            plan.project_id,
+            plan.screen_id,
+            plan.sku_id,
+            plan.buy_num,
+        )
+        if token:
+            self._log("  [预确认] 已获取下单 token")
+
+        payload = build_payload(
+            plan.project_id,
+            plan.screen_id,
+            plan.sku_id,
+            plan.buy_num,
+            pay_fen,
+            plan.buyer,
+            token=token,
+        )
+        device_id = self.client.cookies.get("deviceFingerprint", "") or self.client.cookies.get("buvid3", "")
+        body = payload_to_dict(payload, device_id)
+
+        if plan.sale_time:
+            self.state = State.WAITING
+            timer = PreciseTimer(time_offset_ms=offset, pre_fire_ms=plan.pre_fire_ms)
+            self._timer = timer
+            self._log(f"  [开售时间] {plan.sale_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            await timer.wait_until(
+                plan.sale_time,
+                on_tick=lambda s: self._log(f"  [倒计时] {s:.0f}s") if s <= 30 else None,
+            )
+            if self._cancelled:
+                self.state = State.CANCELLED
+                return None
+
+        self.state = State.ORDERING
+        interval_s = max(plan.grab_interval_ms, 50) / 1000
+
+        for attempt in range(1, plan.max_attempts + 1):
+            if self._cancelled:
+                self.state = State.CANCELLED
+                return None
+
+            self._log(f"  [下单] 第 {attempt}/{plan.max_attempts} 次请求...")
+            t0 = datetime.now()
+            result = await submit_order(self.client, body, attempt=attempt)
+            elapsed = (datetime.now() - t0).total_seconds() * 1000
+            self.last_result = result
+
+            if result.success:
+                self.state = State.SUCCESS
+                self._log(f"  [成功] order_id={result.order_id} ({elapsed:.0f}ms)")
+                return result
+
+            self._log(f"  [失败] {result.message} ({elapsed:.0f}ms)")
+            if attempt >= plan.max_attempts or not is_retryable(result):
+                self.state = State.FAILED
+                return result
+
+            await asyncio.sleep(interval_s)
+
+        self.state = State.FAILED
+        return self.last_result

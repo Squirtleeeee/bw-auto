@@ -1,9 +1,8 @@
-"""
-会员购 API — show.bilibili.com
-"""
+"""会员购 API — show.bilibili.com"""
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import httpx
@@ -11,26 +10,19 @@ import httpx
 SHOW_BASE = "https://show.bilibili.com"
 
 
+def _detail_headers(project_id: str) -> dict[str, str]:
+    return {"Referer": f"https://show.bilibili.com/platform/detail.html?id={project_id}"}
+
+
 async def get_project_detail(
     client: httpx.AsyncClient,
     project_id: str,
     source: str = "pc",
 ) -> dict[str, Any]:
-    """获取商品详情
-
-    GET /api/ticket/project/get?id={project_id}&source={source}
-
-    返回的 data 包含:
-      - id, name: 商品 ID / 名称
-      - sale_flag: 1=预售, 2=在售, 3=已售罄
-      - sale_time: 开售时间
-      - screen_list: [{id, name, sale_start, sale_end}]
-      - sku_list: [{id, name, price, sale_count, limit_per_user}]
-    """
     resp = await client.get(
         f"{SHOW_BASE}/api/ticket/project/get",
         params={"id": project_id, "source": source},
-        headers={"Referer": f"https://show.bilibili.com/platform/detail.html?id={project_id}"},
+        headers=_detail_headers(project_id),
     )
     resp.raise_for_status()
     data = resp.json()
@@ -40,88 +32,140 @@ async def get_project_detail(
 
 
 async def get_buyer_list(client: httpx.AsyncClient) -> list[dict[str, Any]]:
-    """获取已保存的购买人列表
-
-    GET /api/ticket/buyer/list
-
-    返回: [{id, name, tel, id_card_no, id_card_type, is_default, ...}]
-    """
     resp = await client.get(
         f"{SHOW_BASE}/api/ticket/buyer/list",
+        params={"nomask": "1"},
         headers={"Referer": "https://show.bilibili.com/"},
     )
     resp.raise_for_status()
     data = resp.json()
     if data.get("errno") != 0:
         raise RuntimeError(f"获取购买人列表失败: {data.get('msg', data)}")
-    return data.get("data", {}).get("list", data.get("data", []))
+    payload = data.get("data")
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        return payload.get("list") or []
+    return []
+
+
+async def prepare_order(
+    client: httpx.AsyncClient,
+    project_id: str,
+    screen_id: str,
+    sku_id: str,
+    count: int = 1,
+) -> dict[str, Any]:
+    """预下单 — 获取 createV2 所需的 token"""
+    body = {
+        "project_id": int(project_id),
+        "screen_id": int(screen_id),
+        "sku_id": int(sku_id),
+        "count": count,
+        "order_type": 1,
+        "token": "",
+        "newRisk": True,
+    }
+    resp = await client.post(
+        f"{SHOW_BASE}/api/ticket/order/prepare",
+        params={"project_id": project_id},
+        json=body,
+        headers=_detail_headers(project_id),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "errno" not in data and "code" in data:
+        data["errno"] = data["code"]
+        data["msg"] = data.get("message", "")
+    return data
+
+
+async def get_confirm_info(
+    client: httpx.AsyncClient,
+    token: str,
+    project_id: str,
+    voucher: str = "",
+) -> dict[str, Any]:
+    """获取订单确认信息（含完整手机号）。
+
+    GET /api/ticket/order/confirmInfo
+
+    返回 data 包含:
+      - contact_info: {username, tel}  — 完整手机号
+      - buyerList: {list: [...]}
+      - pay_money, screen_id, sku_id 等
+    """
+    resp = await client.get(
+        f"{SHOW_BASE}/api/ticket/order/confirmInfo",
+        params={
+            "token": token,
+            "voucher": voucher,
+            "project_id": project_id,
+            "requestSource": "pc-new",
+        },
+        headers=_detail_headers(project_id),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "errno" not in data and "code" in data:
+        data["errno"] = data["code"]
+        data["msg"] = data.get("message", "")
+    return data
 
 
 async def create_order_v2(
     client: httpx.AsyncClient,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """创建订单 (下单) — 使用 createV2 端点
+    """创建订单 — 格式经浏览器验证"""
+    import json as _json
 
-    POST /api/ticket/order/createV2?project_id={project_id}
+    pid = int(payload.get("project_id", 0))
+    device_id = payload.get("deviceId", "") or client.cookies.get("deviceFingerprint", "")
+    buyer_name = payload.get("buyer", "")
+    buyer_tel = payload.get("tel", "")
 
-    从 confirmOrder JS 逆向出的完整 payload:
-      project_id, screen_id, sku_id, count, pay_money,
-      order_type, timestamp, promo_id, promo_group_id,
-      buyer_info, deliver_info, seats, coupon_code,
-      voucher, token, use_year_card, deviceId, clickPosition,
-      newRisk: true, requestSource: "pc-new"
-
-    buyer_info 格式 (从 saved buyer profile):
-      {name, tel, id_card_type: 0, id_card_no}
-
-    返回: {errno: 0, data: {order_id: "..."}}
-    """
-    import time
-
-    project_id = payload.get("project_id", "")
-    csrf = client.cookies.get("bili_jct", "")
+    # buyer_info: JSON-encoded string (key difference from earlier attempts)
+    buyer_info = payload.get("buyer_info") or []
+    if isinstance(buyer_info, list):
+        buyer_info = _json.dumps(buyer_info, ensure_ascii=False)
+    deliver_info = payload.get("deliver_info")
+    if isinstance(deliver_info, dict):
+        deliver_info = _json.dumps(deliver_info, ensure_ascii=False)
+    elif not deliver_info:
+        deliver_info = _json.dumps({"name": buyer_name, "tel": buyer_tel, "addr_id": 0, "addr": ""}, ensure_ascii=False)
 
     body = {
-        "project_id": project_id,
-        "screen_id": payload.get("screen_id", ""),
-        "sku_id": payload.get("sku_id", ""),
+        "project_id": pid,
+        "screen_id": int(payload.get("screen_id", 0)),
+        "sku_id": int(payload.get("sku_id", 0)),
         "count": payload.get("count", 1),
         "pay_money": payload.get("pay_money", 0),
         "order_type": payload.get("order_type", 1),
-        "timestamp": payload.get("timestamp", int(time.time())),
-        "promo_id": payload.get("promo_id", ""),
-        "promo_group_id": payload.get("promo_group_id", ""),
-        "buyer_info": payload.get("buyer_info", {}),
-        "deliver_info": payload.get("deliver_info", {"deliver_type": 0}),
-        "seats": payload.get("seats", []),
-        "coupon_code": payload.get("coupon_code", ""),
-        "voucher": payload.get("voucher", ""),
+        "timestamp": payload.get("timestamp", int(time.time() * 1000)),
+        "deviceId": device_id,
+        "buyer": buyer_name,
+        "tel": buyer_tel,
+        "buyer_info": buyer_info,
+        "deliver_info": deliver_info,
         "token": payload.get("token", ""),
-        "use_year_card": payload.get("use_year_card", ""),
-        "deviceId": payload.get("deviceId", ""),
-        "clickPosition": payload.get("clickPosition", ""),
+        "again": payload.get("again", 0),
+        "coupon_code": payload.get("coupon_code", ""),
         "newRisk": True,
         "requestSource": "pc-new",
     }
 
-    # csrf token 放在 body 里
-    if csrf:
-        body["csrf_token"] = csrf
-    if payload.get("csrf_token"):
-        body["csrf_token"] = payload["csrf_token"]
-
-    # captureVerifyCode 相关
-    if payload.get("capture_code"):
-        body["captureVerifyCode"] = payload["capture_code"]
-
     resp = await client.post(
-        f"{SHOW_BASE}/api/ticket/order/createV2?project_id={project_id}",
+        f"{SHOW_BASE}/api/ticket/order/createV2?project_id={pid}",
         json=body,
         headers={
-            "Referer": f"https://show.bilibili.com/platform/detail.html?id={project_id}",
+            "Referer": _detail_headers(str(pid))["Referer"],
             "Origin": "https://show.bilibili.com",
         },
     )
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    if "errno" not in data and "code" in data:
+        data["errno"] = data["code"]
+        data["msg"] = data.get("message", "")
+    return data

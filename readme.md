@@ -1,6 +1,8 @@
 # bw-auto — Bilibili 会员购抢票脚本
 
-从零上手的 B 站会员购抢票工具。扫码登录 → 交互式选择场次票档 → 到点毫秒级自动下单 → 提示去 App 支付。
+从零上手的 B 站会员购抢票工具。扫码登录 → 选择商品/场次/票档/购买人 → 可设定脚本启动时间与开售时间 → 到点自动下单（失败按间隔重试）→ 在 App 内支付。
+
+支持 **终端交互** 与 **Web 界面** 两种方式。
 
 ## 环境要求
 
@@ -26,7 +28,23 @@ bw-auto --help
 
 ## 使用方法
 
-### 第一步：扫码登录（首次或 Cookie 过期时）
+### 方式 A：Web 界面（推荐）
+
+```bash
+bw-auto web
+```
+
+浏览器打开 `http://127.0.0.1:8765`：
+
+1. 扫码登录
+2. 输入商品 `project_id` 并加载
+3. 选择场次、票档、购买人（须已在 B 站 App 会员购中添加实名信息）
+4. 可选：脚本启动时间、开售时间、提前发单、重试间隔
+5. 开始抢票 → 成功后到 App 支付
+
+### 方式 B：终端命令
+
+#### 第一步：扫码登录（首次或 Cookie 过期时）
 
 ```bash
 bw-auto login
@@ -113,20 +131,29 @@ bw-auto grab --id 1000322
 | `bw-auto login` | 扫码登录 | 无 |
 | `bw-auto status` | 检查登录状态 | 无 |
 | `bw-auto info --id ID` | 查看商品详情 | `--id` 商品 project_id |
-| `bw-auto grab --id ID` | 交互式抢票 | `--id` 商品ID, `--num` 数量(默认1), `--time` 手动指定开售时间, `--pre-fire` 提前发送毫秒数(默认200) |
+| `bw-auto grab --id ID` | 交互式抢票 | 见下方高级参数 |
+| `bw-auto web` | 启动 Web 界面 | `--host` `--port` |
 
 ### 高级参数
 
 ```bash
-# 手动指定开售时间（不从商品数据读取）
+# 手动指定开售时间
 bw-auto grab --id 1000322 --time "2026-06-15 12:00:00"
 
-# 调整提前发送量（越大越早发请求，默认 200ms）
-bw-auto grab --id 1000322 --pre-fire 300
+# 脚本在 11:58 启动，12:00 开售瞬间下单
+bw-auto grab --id 1000322 --start "2026-06-15 11:58:00" --time "2026-06-15 12:00:00"
+
+# 提前发单 300ms；失败后每 250ms 重试，最多 20 次
+bw-auto grab --id 1000322 --pre-fire 300 --interval 250 --attempts 20
+
+# 使用 .env 预设（复制 .env.example 为 .env 后填写）
+bw-auto grab -y
 
 # 多张票
 bw-auto grab --id 1000322 --num 2
 ```
+
+非交互模式在 `.env` 中设置 `TARGET_PROJECT_ID`、`TARGET_SCREEN_ID`、`TARGET_SKU_ID` 等。
 
 ## 文件说明
 
@@ -151,7 +178,13 @@ bw-auto/
     │   ├── order.py       # 下单请求构造
     │   └── scheduler.py   # 毫秒级精确定时器
     ├── bot/
-    │   └── engine.py      # 抢票状态机编排
+    │   └── engine.py      # 抢票引擎（定时/重试）
+    ├── web/
+    │   ├── app.py         # FastAPI Web UI
+    │   └── static/        # 前端页面
+    ├── services/          # CLI/Web 共用逻辑
+    ├── config.py
+    ├── http_client.py
     └── utils/
         ├── time_sync.py   # 与 B 站服务器时间对齐
         └── terminal.py    # rich 终端美化
@@ -191,13 +224,17 @@ Content-Type: application/json
 ### 抢票时序
 
 ```
+脚本启动时间 S（可选）
+  │
+  ├── 时间同步 + 连接预热 + 预确认获取 token
+  │
 开售时间 T
   │
-  ├── T-3000ms  时间同步（对齐 B 站服务器时钟）
-  ├── T-500ms   准备请求体
-  ├── T-200ms   busy-wait 自旋等待（毫秒级精度）
-  └── T          发送 POST 请求
+  ├── 精确等待（pre-fire 提前发单，抵消网络延迟）
+  └── T         发送 createV2；失败则按 grab_interval 重试
 ```
+
+支付请在 **Bilibili App** 中完成；本工具只负责提交订单。
 
 ### 数据模型
 

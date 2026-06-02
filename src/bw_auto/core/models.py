@@ -12,13 +12,13 @@ class BuyerInfo:
     """实名购买人信息"""
     name: str = ""
     tel: str = ""
-    id_card_type: int = 0       # 0 = 身份证
+    id_card_type: int = 0
     id_card_no: str = ""
+    buyer_id: str = ""
 
 
 @dataclass
 class Screen:
-    """场次信息"""
     screen_id: str
     name: str
     sale_start: datetime | None = None
@@ -27,50 +27,63 @@ class Screen:
 
 @dataclass
 class Sku:
-    """票档 / SKU"""
     sku_id: str
+    screen_id: str
     name: str
-    price: float = 0.0          # 原始单价 (分)
-    stock: int = 0              # 库存
-    limit_per_user: int = 1     # 每人限购
+    price_fen: int = 0
+    stock: int = 0
+    limit_per_user: int = 1
 
 
 @dataclass
 class Item:
-    """会员购商品"""
     project_id: str
     name: str
+    sale_flag: int = 0
     screens: list[Screen] = field(default_factory=list)
     skus: list[Sku] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
-    @property
-    def first_screen_id(self) -> str:
-        return self.screens[0].screen_id if self.screens else ""
+    def skus_for_screen(self, screen_id: str) -> list[Sku]:
+        return [s for s in self.skus if s.screen_id == screen_id]
 
-    @property
-    def first_sku_id(self) -> str:
-        return self.skus[0].sku_id if self.skus else ""
+    def get_sku(self, sku_id: str) -> Sku | None:
+        return next((s for s in self.skus if s.sku_id == sku_id), None)
 
 
 @dataclass
 class OrderPayload:
-    """下单请求体"""
     project_id: str
     screen_id: str
     sku_id: str
     buy_num: int = 1
-    pay_money: float = 0.0
+    pay_money: int = 0
     buyer_info: BuyerInfo = field(default_factory=BuyerInfo)
     deliver_info: dict = field(default_factory=lambda: {"deliver_type": 0})
-    coupon_list: list = field(default_factory=list)
     token: str = ""
 
 
 @dataclass
 class OrderResult:
-    """下单结果"""
     success: bool
     order_id: str = ""
     message: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+    attempt: int = 0
+
+
+@dataclass
+class GrabPlan:
+    """一次抢票任务的完整参数"""
+    project_id: str
+    screen_id: str
+    sku_id: str
+    buy_num: int = 1
+    pay_money_fen: int = 0
+    buyer: BuyerInfo = field(default_factory=BuyerInfo)
+    sale_time: datetime | None = None
+    schedule_start: datetime | None = None
+    pre_fire_ms: float = 200.0
+    grab_interval_ms: float = 300.0
+    max_attempts: int = 15
+    prewarm_connections: int = 3

@@ -1,16 +1,20 @@
 [project]
 name = "bw-auto"
-version = "0.1.0"
+version = "0.2.0"
 description = "Bilibili 会员购抢票工具"
 requires-python = ">=3.11"
 
 dependencies = [
     "httpx>=0.27",
     "qrcode>=7.4",
+    "Pillow>=10.0",
     "rich>=13.0",
     "click>=8.1",
     "python-dotenv>=1.0",
     "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
 ]
 
 [project.optional-dependencies]
